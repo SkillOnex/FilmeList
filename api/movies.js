@@ -1,6 +1,41 @@
-import { kv } from '@vercel/kv';
+import { MongoClient } from 'mongodb';
 
-const STORAGE_KEY = 'discordia:movies';
+const COLLECTION_NAME = 'movies';
+const DB_NAME = 'filmelist';
+
+// Cache da conexão
+let cachedClient = null;
+let cachedDb = null;
+
+// Função para conectar ao MongoDB
+async function connectToDatabase() {
+  // Verifica se já existe uma conexão em cache
+  if (cachedClient && cachedDb) {
+    return { client: cachedClient, db: cachedDb };
+  }
+
+  // Verifica se a URI do MongoDB está configurada
+  if (!process.env.MONGODB_URI) {
+    throw new Error('MONGODB_URI não configurada. Configure a variável de ambiente MONGODB_URI');
+  }
+
+  try {
+    // Conecta ao MongoDB
+    const client = new MongoClient(process.env.MONGODB_URI);
+    await client.connect();
+    
+    const db = client.db(DB_NAME);
+    
+    // Cache da conexão
+    cachedClient = client;
+    cachedDb = db;
+    
+    return { client, db };
+  } catch (error) {
+    console.error('Erro ao conectar ao MongoDB:', error);
+    throw error;
+  }
+}
 
 export default async function handler(req, res) {
   // CORS headers
@@ -13,15 +48,17 @@ export default async function handler(req, res) {
   }
 
   try {
+    const { db } = await connectToDatabase();
+    const collection = db.collection(COLLECTION_NAME);
+
     switch (req.method) {
       case 'GET': {
-        const movies = await kv.get(STORAGE_KEY);
+        const movies = await collection.find({}).sort({ addedAt: -1 }).toArray();
         return res.status(200).json(movies || []);
       }
 
       case 'POST': {
         const movie = req.body;
-        const movies = (await kv.get(STORAGE_KEY)) || [];
         const newMovie = {
           ...movie,
           id: movie.id || Date.now(),
@@ -30,28 +67,34 @@ export default async function handler(req, res) {
           favorite: movie.favorite || false,
           personalRating: movie.personalRating || null,
         };
-        movies.unshift(newMovie);
-        await kv.set(STORAGE_KEY, movies);
+        
+        await collection.insertOne(newMovie);
         return res.status(201).json(newMovie);
       }
 
       case 'PUT': {
         const { id, updates } = req.body;
-        const movies = (await kv.get(STORAGE_KEY)) || [];
-        const index = movies.findIndex((m) => m.id === id);
-        if (index === -1) {
+        const result = await collection.findOneAndUpdate(
+          { id: id },
+          { $set: updates },
+          { returnDocument: 'after' }
+        );
+        
+        if (!result.value) {
           return res.status(404).json({ error: 'Filme não encontrado' });
         }
-        movies[index] = { ...movies[index], ...updates };
-        await kv.set(STORAGE_KEY, movies);
-        return res.status(200).json(movies[index]);
+        
+        return res.status(200).json(result.value);
       }
 
       case 'DELETE': {
         const { id } = req.body;
-        const movies = (await kv.get(STORAGE_KEY)) || [];
-        const filtered = movies.filter((m) => m.id !== id);
-        await kv.set(STORAGE_KEY, filtered);
+        const result = await collection.deleteOne({ id: id });
+        
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ error: 'Filme não encontrado' });
+        }
+        
         return res.status(200).json({ success: true });
       }
 
@@ -60,10 +103,17 @@ export default async function handler(req, res) {
     }
   } catch (error) {
     console.error('Erro na API:', error);
-    // Se KV não estiver configurado, retorna array vazio
-    if (error.message?.includes('KV') || error.code === 'ENOTFOUND') {
-      return res.status(200).json([]);
+    
+    // Se MongoDB não estiver configurado, retorna array vazio para GET
+    if (error.message?.includes('MONGODB_URI') || error.message?.includes('Mongo')) {
+      if (req.method === 'GET') {
+        return res.status(200).json([]);
+      }
+      return res.status(503).json({ 
+        error: 'MongoDB não configurado. Configure a variável de ambiente MONGODB_URI' 
+      });
     }
+    
     return res.status(500).json({ error: 'Erro interno do servidor' });
   }
 }
